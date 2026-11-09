@@ -2667,36 +2667,45 @@ export const make = Effect.gen(function* PreviewAutomationMake() {
     ) {
       const contents = yield* resolveAttached(input.webContentsId);
       const forAgent = input.forAgent === true;
-      // Captured through CDP rather than capturePage so the image is the page
-      // itself, whether the window is covered, minimised or hidden (a hidden
-      // window's page has to be `working` on Windows; the panel makes an
-      // agent's pages so). Not while the screen is locked: nothing is
-      // painted, and the capture would wait until the user is back. So then
-      // it gets a short wait, and an answer that says why.
+      // CDP's Page.captureScreenshot holds a display wake lock until Chromium
+      // finishes the capture, even after our caller times out. Electron lets
+      // us capture the page without keeping the display awake. Keep the same
+      // short deadline behind a locked screen, where frames may stop painting.
       const lockedAtStart = isScreenLocked();
-      const shot = (yield* sendCommand(
-        contents,
-        "Page.captureScreenshot",
-        {
-          format: "png",
-          captureBeyondViewport: false,
-          // An agent's picture is decoded and re-encoded below, so a quicker,
-          // larger PNG is the better trade: on a busy page it holds up the
-          // main process for a fraction as long.
-          ...(forAgent ? { optimizeForSpeed: true } : {}),
-        },
-        {
-          timeout: lockedAtStart ? LOCKED_CAPTURE_TIMEOUT : CDP_COMMAND_TIMEOUT,
-          timedOut: () => (lockedAtStart || isScreenLocked() ? SCREEN_LOCKED : PAGE_DID_NOT_DRAW),
-        },
-      )) as { data?: string };
+      const shot = yield* Effect.gen(function* () {
+        // capturePage can return the previous surface immediately after a DOM
+        // change. Let it paint first, in the world the page cannot redefine.
+        yield* evaluateInjected(
+          contents,
+          "new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(null))))",
+          { returnByValue: true },
+        );
+        return yield* Effect.tryPromise({
+          try: () => contents.capturePage(undefined, { stayHidden: false, stayAwake: false }),
+          catch: (cause) =>
+            new PreviewCommandError({ webContentsId: contents.id, method: "capturePage", cause }),
+        });
+      }).pipe(
+        Effect.timeoutOrElse({
+          duration: lockedAtStart ? LOCKED_CAPTURE_TIMEOUT : CDP_COMMAND_TIMEOUT,
+          orElse: () =>
+            Effect.fail(
+              new PreviewCommandError({
+                webContentsId: contents.id,
+                method: "capturePage",
+                cause: lockedAtStart || isScreenLocked() ? SCREEN_LOCKED : PAGE_DID_NOT_DRAW,
+              }),
+            ),
+        }),
+      );
       const metrics = (yield* sendCommand(contents, "Page.getLayoutMetrics", {})) as {
         cssVisualViewport?: { clientWidth?: number; clientHeight?: number };
       };
       const width = Math.round(metrics.cssVisualViewport?.clientWidth ?? 0);
       const height = Math.round(metrics.cssVisualViewport?.clientHeight ?? 0);
+      const data = shot.toPNG().toString("base64");
       if (!forAgent) {
-        return { dataUrl: `data:image/png;base64,${shot.data ?? ""}`, width, height };
+        return { dataUrl: `data:image/png;base64,${data}`, width, height };
       }
       // Read in the injected world, where the page cannot redefine it.
       const ratio = yield* evaluateInjected(contents, "window.devicePixelRatio", {
@@ -2704,7 +2713,7 @@ export const make = Effect.gen(function* PreviewAutomationMake() {
       });
       const devicePixelRatio = typeof ratio.value === "number" ? ratio.value : 0;
       return {
-        ...encodeForAgent(shot.data ?? "", devicePixelRatio, input.jpeg === true),
+        ...encodeForAgent(data, devicePixelRatio, input.jpeg === true),
         width,
         height,
       };
